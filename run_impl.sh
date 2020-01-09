@@ -1,0 +1,22 @@
+mkdir -p build
+cd build
+rm -rf *
+
+LIB_DIR=$1
+MODEL_NAME=$2
+WITH_MKL=$3
+WITH_GPU=$4
+CUDNN_LIB=$5
+CUDA_LIB=$6
+USE_TENSORRT=$7
+
+cmake .. -DPADDLE_LIB=${LIB_DIR} \
+  -DWITH_MKL=${WITH_MKL} \
+  -DMODEL_NAME=${MODEL_NAME} \
+  -DWITH_GPU=${WITH_GPU} \
+  -DWITH_STATIC_LIB=OFF \
+  -DUSE_TENSORRT=${USE_TENSORRT} \
+  -DCUDNN_LIB=${CUDNN_LIB} \
+  -DCUDA_LIB=${CUDA_LIB}
+
+make -j
