@@ -53,6 +53,11 @@ def parse_args():
         type=int,
         default=1,
         help='Whether to use dygraph to train')
+    parser.add_argument(
+        '--use_multi_gpu',
+        type=int,
+        default=0,
+        help='Whether to use multi-gpu training')
     return parser.parse_args()
 
 
@@ -231,13 +236,22 @@ class ResNet(fluid.Layer):
         return y
 
 
-def train_dygraph(epoch_num):
+def train_dygraph(dev_id, epoch_num, use_multi_gpu):
+    strategy = fluid.dygraph.parallel.prepare_context(
+    ) if use_multi_gpu else None
+
     resnet = ResNet()
     optimizer = optimizer_setting(
         train_parameters, parameter_list=resnet.parameters())
 
+    if use_multi_gpu:
+        resnet = fluid.dygraph.parallel.DataParallel(resnet, strategy)
+
     traced_layer = None
     reader = create_reader()
+
+    if use_multi_gpu:
+        reader = fluid.contrib.distributed_batch_reader(reader)
 
     image_shape = train_parameters['input_size']
 
@@ -257,21 +271,29 @@ def train_dygraph(epoch_num):
 
             loss = fluid.layers.cross_entropy(out, label)
             avg_loss = fluid.layers.mean(loss)
+            avg_loss_val = avg_loss.numpy()
+
+            if use_multi_gpu:
+                avg_loss = resnet.scale_loss(avg_loss)
 
             avg_loss.backward()
+
+            if use_multi_gpu:
+                resnet.apply_collective_grads()
 
             optimizer.minimize(avg_loss)
 
             resnet.clear_gradients()
 
             if i % 10 == 0:
-                print('Epoch {}, batch {}, avg_loss {}'.format(
-                    epoch_id, i, avg_loss.numpy()))
+                print('Epoch {}, batch {}, avg_loss {}'.format(epoch_id, i,
+                                                               avg_loss_val))
 
-    traced_layer.save_inference_model('./infer_dygraph')
+    if dev_id == 0:
+        traced_layer.save_inference_model('./infer_dygraph')
 
 
-def train_static_graph(epoch_num):
+def train_static_graph(epoch_num, use_multi_gpu):
     resnet = ResNet()
     image = fluid.data(
         name='image',
@@ -286,25 +308,36 @@ def train_static_graph(epoch_num):
     optimizer.minimize(avg_loss)
 
     program = fluid.default_main_program()
-    place = fluid.CUDAPlace(0) if fluid.is_compiled_with_cuda(
-    ) else fluid.CPUPlace()
+    if use_multi_gpu:
+        program = fluid.CompiledProgram(program).with_data_parallel(
+            loss_name=avg_loss.name)
+
+    place = fluid.CUDAPlace(0)
     exe = fluid.Executor(place)
 
     exe.run(fluid.default_startup_program())
-
     image_shape = train_parameters['input_size']
 
     reader = create_reader()
+
+    def single_device_feed_reader(reader):
+        def __impl__():
+            for data in reader():
+                image_np = np.array(
+                    [np.reshape(x[0], image_shape) for x in data])
+                label_np = np.array([x[1] for x in data])
+                yield {image.name: image_np, label.name: label_np}
+
+        return __impl__
+
+    reader = single_device_feed_reader(reader)
+    if use_multi_gpu:
+        reader = paddle.batch(
+            reader, batch_size=len(fluid.cuda_places()), drop_last=True)
+
     for epoch_id in six.moves.range(epoch_num):
         for i, data in enumerate(reader()):
-            image_np = np.array([np.reshape(x[0], image_shape) for x in data])
-            label_np = np.array([x[1] for x in data])
-
-            avg_loss_val, = exe.run(
-                program,
-                feed={image.name: image_np,
-                      label.name: label_np},
-                fetch_list=[avg_loss])
+            avg_loss_val, = exe.run(program, feed=data, fetch_list=[avg_loss])
 
             if i % 10 == 0:
                 print('Epoch {}, batch {}, avg_loss {}'.format(epoch_id, i,
@@ -325,13 +358,17 @@ def set_random_seed(seed):
 
 if __name__ == '__main__':
     args = parse_args()
-    use_static_graph = args.use_dygraph
+    use_dy_graph = args.use_dygraph
+    use_multi_gpu = args.use_multi_gpu
     epoch_num = 32
 
-    if use_static_graph:
+    if not use_dy_graph:
         set_random_seed(1)
-        train_static_graph(epoch_num)
+        print('use static graph !!!')
+        train_static_graph(epoch_num, use_multi_gpu)
     else:
-        with fluid.dygraph.guard():
+        dev_id = fluid.dygraph.parallel.Env().dev_id if use_multi_gpu else 0
+        place = fluid.CUDAPlace(dev_id)
+        with fluid.dygraph.guard(place):
             set_random_seed(1)
-            train_dygraph(epoch_num)
+            train_dygraph(dev_id, epoch_num, use_multi_gpu)
